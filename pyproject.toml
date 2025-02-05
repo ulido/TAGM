@@ -1,0 +1,14 @@
+[project]
+name = "tagm"
+version = "0.0.1"
+description = "T-augmented Gaussian Mixture Model"
+dependencies = [
+    "numpy >= 1.26.4",
+    "scipy >= 1.15.1",
+    "scikit-learn >= 1.6.1",
+]
+requires-python = ">= 3.10"
+
+[build-system]
+requires = ["flit_core>=3.4"]
+build-backend = "flit_core.buildapi"
