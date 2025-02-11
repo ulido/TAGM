@@ -2,6 +2,7 @@
 
 # Author: Ulrich Dobramysl
 
+import random
 import warnings
 import numpy as np
 from numpy.typing import NDArray
@@ -9,6 +10,7 @@ from scipy.special import loggamma as lgΓ
 from scipy.stats import dirichlet, invwishart, beta
 
 from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.cluster import KMeans
 
 all = ["TAGMMAP"]
 
@@ -34,8 +36,6 @@ def log_gaussian(
     sign, log_D = np.linalg.slogdet(Σ)
     if sign == 0:
         raise ValueError("sigma is singular.")
-    elif sign == -1:
-        raise ValueError("sigma is negative semi-definite.")
 
     x_µ = x - µ[np.newaxis, :]
 
@@ -67,9 +67,7 @@ def log_t(
     sign, log_D = np.linalg.slogdet(Σ)
     if sign == 0:
         raise ValueError("sigma is singular.")
-    elif sign == -1:
-        raise ValueError("sigma is negative semi-definite.")
-
+    
     x_µ = x - µ[np.newaxis, :]
     Σi = np.linalg.inv(Σ)
 
@@ -86,6 +84,7 @@ def log_t(
 class _TAGMFitData:
     # Fitting data
     X: NDArray[np.float64]
+    unknowns: NDArray[np.float64]
     y: NDArray[np.float64]
 
     # Dimensions
@@ -101,11 +100,15 @@ class _TAGMFitData:
     lambda_0: float
     nu_0: float
     S_0: NDArray[np.float64]        # (D, D)
+    S_k: NDArray[np.float64]        # (K, D, D)
     kappa: float
     M: NDArray[np.float64]          # (D,)
     V: NDArray[np.float64]          # (D, D)
     u: float
     v: float
+
+    # Constants
+    m_k: NDArray[np.float64]        # (K, D)
 
     # Posteriors
     pi_k: NDArray[np.float64]       # (K,)
@@ -129,9 +132,9 @@ class _TAGMFitData:
     ):
         self.X = X
         self.y = y
+        self.unknowns = self.X[~self.y.any(axis=1), :]
 
         # Initialise dimensions and label weights
-        self.N = X.shape[0]
         self.K = y.shape[1]
         self.D = X.shape[1]
         if y.shape[0] != X.shape[0]:
@@ -149,7 +152,9 @@ class _TAGMFitData:
         self.beta_k = self.beta_0 + self.weights
 
         ## Initialise Normal priors
-        self.mu_0 = self.X.mean(axis=0)
+        markerData = self.X[y.any(axis=1), :]
+        self.N = markerData.shape[0]    # I'm pretty sure this is wrong, but pRoloc has that. I think it should be X.shape[0] instead.
+        self.mu_0 = markerData.mean(axis=0)
         self.lambda_0 = lambda_0
 
         ## Initialise Normal Inverse Wishart priors
@@ -157,7 +162,7 @@ class _TAGMFitData:
             self.nu_0 = self.D + 2
         else:
             self.nu_0 = nu_0
-        self.S_0 = np.diag(self.X.var(axis=0) / (self.K ** (1 / self.D)))
+        self.S_0 = np.diag(((markerData - markerData.mean())**2).sum(axis=0) / self.N) / (self.K ** (1 / self.D))
 
         ## Initialise multivariate T-distribution priors
         self.kappa = kappa
@@ -184,30 +189,31 @@ class _TAGMFitData:
         self.x_k = np.empty((self.K, self.D))
         for k in range(self.K):
             self.x_k[k] = self.X[self.y[:, k], :].mean(axis=0)
-        self.mu_k = (
+        self.m_k = (
             self.weights[:, np.newaxis] * self.x_k
             + (self.lambda_0 * self.mu_0)[np.newaxis, :]
         ) / (self.lambda_0 + self.weights)[:, np.newaxis]
+        self.mu_k = self.m_k.copy()
 
         ## Component covariance
         lambda_k = self.lambda_0 + self.weights
-        S_k = np.empty((self.K, self.D, self.D))
+        self.S_k = np.empty((self.K, self.D, self.D))
         for k in range(self.K):
             XX: NDArray[np.float64] = X[y[:, k], :]
-            S_k[k] = (
+            self.S_k[k] = (
                 self.S_0
                 + (XX.T @ XX)
                 + (self.lambda_0 * (self.mu_0[:, np.newaxis] * self.mu_0[np.newaxis, :]))
                 - lambda_k[k] * (self.mu_k[k, :, np.newaxis] * self.mu_k[k, np.newaxis, :])
             )
         nu_k = self.nu_0 + self.weights
-        self.sigma_k = S_k / (nu_k[:, np.newaxis, np.newaxis] + self.D + 1)
+        self.sigma_k = self.S_k / (nu_k[:, np.newaxis, np.newaxis] + self.D + 1)
 
         # Initialise outlier component
         self.epsilon = (self.u - 1) / (self.u + self.v - 2)
 
         # Initialise data array
-        self.ab = np.empty((self.K, self.N, 2))
+        self.ab = np.empty((self.K, self.unknowns.shape[0], 2))
 
     def log_f(self, k, x):
         return log_gaussian(x, self.mu_k[k], self.sigma_k[k])
@@ -230,6 +236,9 @@ class TAGMMAP(ClassifierMixin, BaseEstimator):
 
     Parameters
     ----------
+
+    n_components : int, default=300
+        The number of mixture components. This is only used when no training data is given in `fit` or `fit_predict`.
 
     max_iter : int, default=100
         The maximum number of iterations allowed. Shows a warning if this is reached without the model having converged.
@@ -283,6 +292,7 @@ class TAGMMAP(ClassifierMixin, BaseEstimator):
     """
     def __init__(
         self,
+        n_components=300,
         max_iter=100,
         tol=1e-4,
         weight_concentration_prior=1.0,
@@ -290,7 +300,9 @@ class TAGMMAP(ClassifierMixin, BaseEstimator):
         degrees_of_freedom_prior=None,       # D + 2
         outlier_conjugate_shape_prior=(2, 10),
         outlier_degrees_of_freedom=4,
+        random_state=None,
     ):
+        self.n_components = n_components
         self.max_iter = max_iter
         self.tol = tol
         self.weight_precision_prior = weight_concentration_prior
@@ -298,8 +310,16 @@ class TAGMMAP(ClassifierMixin, BaseEstimator):
         self.degrees_of_freedom_prior = degrees_of_freedom_prior
         self.outlier_degrees_of_freedom = outlier_degrees_of_freedom
         self.outlier_conjugate_shape_prior = outlier_conjugate_shape_prior
+        self.random_state = random_state
 
-    def fit(self, X, y):
+    def _initialise_clusters(self, X):
+        kmeans = KMeans(n_clusters=self.n_components, random_state=self.random_state)
+        kmeans.fit(X)
+        y = np.zeros((X.shape[0], self.n_components), dtype=bool)
+        y[np.arange(y.shape[0]), kmeans.labels_] = True
+        return y
+
+    def fit(self, X, y=None):
         """Estimate model parameters with the EM algorithm.
         
         Fits the model by iterating the expectation-maximisation (EM) algorithm until either convergence is achieved or `max_iter` is reached.
@@ -309,14 +329,17 @@ class TAGMMAP(ClassifierMixin, BaseEstimator):
         X : array-like of shape (n_samples, n_features)
             Input data, each row represents a single data point.
 
-        y : array-like of shape (n_samples, n_outputs)
+        y : None or array-like of shape (n_samples, n_outputs), default=None
             Training data, in the form of one row per data point given in `X`. Each column represents a different label. A data point for which the classification is known has at least one column that is `True`, but can have more than one.
-
+            If None, the initial parameters are chosen by running a k-means clustering algorithm finding n_components clusters.
         Returns
         -------
         self : object
             The fitted TAGMMAP model.
         """
+        if y is None:
+            y = self._initialise_clusters(X)
+
         self._data = _TAGMFitData(
             X,
             y,
@@ -370,7 +393,7 @@ class TAGMMAP(ClassifierMixin, BaseEstimator):
 
     def _estep(self):
         d = self._data
-        d.ab[:] = self._ab(d.X)
+        d.ab[:] = self._ab(d.unknowns)
 
     def _mstep(self):
         d = self._data
@@ -379,36 +402,41 @@ class TAGMMAP(ClassifierMixin, BaseEstimator):
         d.epsilon = (d.u + b - 1) / (a + b + d.u + d.v - 2)
 
         r = d.ab.sum(axis=2).sum(axis=1)
-        self.pi_k = (
+        d.pi_k = (
             (r + d.beta_k - 1) /
-            (d.N + d.beta_k.sum() - d.K)
+            (d.unknowns.shape[0] + d.beta_k.sum() - d.K)
         )
 
         xm_k: NDArray[np.float64] = (
-            (d.ab[:, :, 0, np.newaxis] * d.X[np.newaxis, :, :]).sum(axis=1) /
+            (d.ab[:, :, 0, np.newaxis] * d.unknowns[np.newaxis, :, :]).sum(axis=1) /
             d.ab[:, :, 0].sum(axis=1)[:, np.newaxis]
         )
 
+        # The definitions of lambda_k and nu_k are different in pRoloc compared to the paper. Not sure why, but we're going with pRoloc here.
         a_k: NDArray[np.float64] = d.ab[:, :, 0].sum(axis=1)
-        lambda_k = d.lambda_0 + a_k
-        nu_k = d.nu_0 + a_k
+        lambda_k = d.lambda_0 + d.weights
+        nu_k = d.nu_0 + d.weights
 
-        self.mu_k = (
-            (a_k[:, np.newaxis] * xm_k + d.lambda_0 * d.mu_0[np.newaxis, :]) /
-            lambda_k[:, np.newaxis]
+        # Again, this uses lambda_k * d.m_k (the initial guess that isn't updated), but according to the paper this should be d.lambda_0 * d.mu_0 instead!
+        # Let's copy pRoloc for now, but we might have to revisit.
+        d.mu_k = (
+            (a_k[:, np.newaxis] * xm_k + lambda_k[:, np.newaxis] * d.m_k) /
+            (lambda_k + a_k)[:, np.newaxis]
         )
 
-        xkmu0 = xm_k - d.mu_0
+        # This /should/ be d.mu_0 according to the paer. The code in pRoloc uses mk.
+        # Still, we want to do what pRoloc is doing, so stick with it.
+        xkmuk = xm_k - d.m_k
         xixk = (
-            (xkmu0[:, :, np.newaxis] * xkmu0[:, np.newaxis, :]) *
-            ((d.lambda_0 * a_k) / lambda_k)[:, np.newaxis, np.newaxis]
+            (xkmuk[:, :, np.newaxis] * xkmuk[:, np.newaxis, :]) *
+            ((lambda_k * a_k) / (lambda_k + a_k))[:, np.newaxis, np.newaxis]
         )
         for k in range(d.K):
-            for i, x in enumerate(d.X):
-                diff: NDArray[np.float64] = d.X[i] - xm_k[k]
-                xixk[k] += d.ab[k, i, 0] * (diff[:, np.newaxis] * diff[np.newaxis, :])
-        S_ki = d.S_0[np.newaxis] + xixk
-        d.sigma_k = S_ki / (nu_k + d.D + 2)[:, np.newaxis, np.newaxis]
+            for i, x in enumerate(d.unknowns):
+                diff: NDArray[np.float64] = d.unknowns[i] - xm_k[k]
+                xixk[k, :, :] += d.ab[k, i, 0] * (diff[:, np.newaxis] * diff[np.newaxis, :])
+        # pRoloc has S_k here instead of S_0 like in the paper.
+        d.sigma_k = (d.S_k + xixk) / (nu_k + a_k + d.D + 2)[:, np.newaxis, np.newaxis]
 
     def _eval_loglikelihood(self):
         d = self._data
@@ -417,14 +445,14 @@ class TAGMMAP(ClassifierMixin, BaseEstimator):
         for k in range(d.K):
             Q += (
                 (d.ab[k].sum(axis=1) * np.log(d.pi_k[k])).sum()
-                + (d.ab[k, :, 0].sum() * np.log(1 - d.epsilon))
-                + (d.ab[k, :, 1].sum() * np.log(d.epsilon))
-                + (d.ab[k, :, 0] * d.log_f(k, d.X)).sum()
-                + (d.ab[k, :, 1] * d.log_g(d.X)).sum()
+                + (d.ab[k, :, 0] * d.log_f(k, d.unknowns)).sum()
+                + log_gaussian(d.mu_k[k], d.mu_0, d.sigma_k[k])[0]
             )
             Q += invwishart.logpdf(d.sigma_k[k], df=d.nu_0, scale=d.S_0)
+        Q += (d.ab[:, :, 1].sum(axis=0) * d.log_g(d.unknowns)).sum()
+        Q += d.ab[:, :, 0].sum() * np.log(1 - d.epsilon) + d.ab[:, :, 1].sum() * np.log(d.epsilon)
         Q += beta.logpdf(d.epsilon, d.u, d.v)
-        Q += dirichlet.logpdf(self.pi_k, alpha=d.beta_0 / d.K)
+        Q += dirichlet.logpdf(d.pi_k, alpha=d.beta_0 / d.K)
         return Q
 
     def predict_proba(self, X: NDArray[np.float64]):
@@ -444,7 +472,7 @@ class TAGMMAP(ClassifierMixin, BaseEstimator):
         """
         ab = self._ab(X)
         probability = np.empty((X.shape[0], self._data.K+1))
-        probability[:, 1:] = ab.sum(axis=2).T
+        probability[:, 1:] = ab[:, :, 0]
         probability[:, 0] = ab[:, :, 1].sum(axis=0)
         return probability
     
