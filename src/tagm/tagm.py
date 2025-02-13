@@ -519,7 +519,7 @@ class TAGMMAP(ClassifierMixin, BaseEstimator):
         probabilities[:, 0] = 0
         return self._inverse_binarize(probabilities)
     
-    def fit_predict(self, X, y, **kwargs):
+    def fit_predict(self, X, y, return_assignment_probability=False, return_outlier_probability=False, **kwargs):
         """Estimate model parameters and predict the localisation for X.
         
         Fits the model by iterating the expectation-maximisation (EM) algorithm until either convergence is achieved or `max_iter` is reached. After this, predicts the localisation of each data point by returning the localisation with the highest probability.
@@ -536,16 +536,40 @@ class TAGMMAP(ClassifierMixin, BaseEstimator):
         y : array-like of shape (n_samples, n_outputs)
             Training data, in the form of one row per data point given in `X`. Each column represents a different label. A data point for which the classification is known has at least one column that is `True`, but can have more than one.
 
+        return_assignment_probability : bool, default=False
+            Return the probabilities of the assigned labels if set to `True`.
+
+        return_outlier_probability : bool, default=False
+            Return the probability of an entry to be part of the outlier component if set to `True`.
+
         Returns
         -------
         localisation : array of shape (n_samples,)
             Predicted localisation.
+
+        assignment_probability (optional): array of shape (n_samples,)
+            Predicted probability of the assigned label, only returned if `return_outlier_probability=True`.
+            
+        outlier_probability (optional): array of shape (n_samples,)
+            Predicted probability of an entry being part of the outlier component, only returned if `return_outlier_probability=True`.
         """
         proba = self.fit_predict_proba(X, y, **kwargs)
+        outlier_proba = proba[:, 0].copy()
         # Ignore the outlier component for classification
         proba[:, 0] = 0.0
-        return self._inverse_binarize(proba)
-    
+        labels = self._inverse_binarize(proba)
+        self.labels_ = labels
+
+        if return_outlier_probability or return_assignment_probability:
+            ret = [labels]
+            if return_assignment_probability:
+                ret.append(proba.max(axis=1))
+            if return_outlier_probability:
+                ret.append(outlier_proba)
+            return tuple(ret)
+        else:
+            return labels
+
     def fit_predict_proba(self, X, y, **kwargs):
         """Estimate model parameters and return the class probabilities for X.
         
