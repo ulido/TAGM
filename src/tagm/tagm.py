@@ -10,7 +10,10 @@ from scipy.special import loggamma as lgΓ
 from scipy.stats import dirichlet, invwishart, beta
 
 from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.calibration import label_binarize
 from sklearn.cluster import KMeans
+from sklearn.utils.validation import validate_data
+from sklearn.utils.multiclass import unique_labels
 
 all = ["TAGMMAP"]
 
@@ -319,7 +322,14 @@ class TAGMMAP(ClassifierMixin, BaseEstimator):
         y[np.arange(y.shape[0]), kmeans.labels_] = True
         return y
 
-    def fit(self, X, y=None):
+    def _binarize(self, y, unknown_label):
+        self.classes_ = np.array([unknown_label] + list(unique_labels(y[y != unknown_label])))
+        return label_binarize(y, classes=self.classes_) > 0
+
+    def _inverse_binarize(self, y):
+        return self.classes_[y.argmax(axis=1)]
+
+    def fit(self, X, y=None, unknown_label=-1):
         """Estimate model parameters with the EM algorithm.
         
         Fits the model by iterating the expectation-maximisation (EM) algorithm until either convergence is achieved or `max_iter` is reached.
@@ -332,17 +342,30 @@ class TAGMMAP(ClassifierMixin, BaseEstimator):
         y : None or array-like of shape (n_samples, n_outputs), default=None
             Training data, in the form of one row per data point given in `X`. Each column represents a different label. A data point for which the classification is known has at least one column that is `True`, but can have more than one.
             If None, the initial parameters are chosen by running a k-means clustering algorithm finding n_components clusters.
+
+        unknown_label: str or int, default=-1
+            Determines which label in `y` is treated as unknown. Common values are "unknown" or `-1`.
+
         Returns
         -------
         self : object
             The fitted TAGMMAP model.
         """
+
+        X, y = validate_data(
+            self,
+            X,
+            y,
+            multi_output=True,
+        )
+
         if y is None:
             y = self._initialise_clusters(X)
+        y = self._binarize(y, unknown_label)
 
         self._data = _TAGMFitData(
             X,
-            y,
+            y[:, 1:],
             self.weight_precision_prior,
             self.mean_precision_prior,
             self.degrees_of_freedom_prior,
@@ -472,7 +495,7 @@ class TAGMMAP(ClassifierMixin, BaseEstimator):
         """
         ab = self._ab(X)
         probability = np.empty((X.shape[0], self._data.K+1))
-        probability[:, 1:] = ab[:, :, 0]
+        probability[:, 1:] = ab[:, :, 0].T
         probability[:, 0] = ab[:, :, 1].sum(axis=0)
         return probability
     
@@ -492,14 +515,18 @@ class TAGMMAP(ClassifierMixin, BaseEstimator):
             Predicted localisation.
         """
         probabilities = self.predict_proba(X)
-        return probabilities.argmax(axis=1)
+        # Ignore the outlier component for classification
+        probabilities[:, 0] = 0
+        return self._inverse_binarize(probabilities)
     
-    def fit_predict(self, X, y):
+    def fit_predict(self, X, y, **kwargs):
         """Estimate model parameters and predict the localisation for X.
         
         Fits the model by iterating the expectation-maximisation (EM) algorithm until either convergence is achieved or `max_iter` is reached. After this, predicts the localisation of each data point by returning the localisation with the highest probability.
 
         A label of `0` indicates that the data point was assigned to the outlier component.
+
+        Note, that this function is different from calling `fit(X, y)` followed by `predict`. This function won't assign a class for entries for which training data exists in `y`, instead returning the class given in `y`.
 
         Parameters
         ----------
@@ -514,5 +541,37 @@ class TAGMMAP(ClassifierMixin, BaseEstimator):
         localisation : array of shape (n_samples,)
             Predicted localisation.
         """
-        self.fit(X, y)
-        return self.predict(X)
+        proba = self.fit_predict_proba(X, y, **kwargs)
+        # Ignore the outlier component for classification
+        proba[:, 0] = 0.0
+        return self._inverse_binarize(proba)
+    
+    def fit_predict_proba(self, X, y, **kwargs):
+        """Estimate model parameters and return the class probabilities for X.
+        
+        Fits the model by iterating the expectation-maximisation (EM) algorithm until either convergence is achieved or `max_iter` is reached. After this, returns the probability for each class.
+        The first returned column indicates the probability that a data point is an outlier.
+
+        Note, that this function is different from calling `fit(X, y)` followed by `predict_proba`. This function won't calculate any probabilities for entries for which training data exists in `y`, instead setting the probability for the corresponding class to one.
+        
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Input data, each row represents a single data point.
+
+        y : array-like of shape (n_samples, n_outputs)
+            Training data, in the form of one row per data point given in `X`. Each column represents a different label. A data point for which the classification is known has at least one column that is `True`, but can have more than one.
+
+        Returns
+        -------
+        localisation : array of shape (n_samples,)
+            Predicted localisation.
+        """
+        self.fit(X, y, **kwargs)
+        
+        proba = np.zeros((self._data.X.shape[0], self._data.y.shape[1]+1))
+        have_training = self._data.y.any(axis=1)
+        proba[~have_training, :] = self.predict_proba(self._data.X[~have_training, :])
+        proba[have_training, self._data.y[have_training].argmax(axis=1)+1] = 1.0
+        return proba
+
