@@ -18,16 +18,17 @@ X = np.vstack([
     np.random.normal(size=(10, 2)) + np.array([-3, 3])[np.newaxis],
 ])
 
-y = np.zeros((X.shape[0], 3), dtype=bool)
+y = -np.ones((X.shape[0],), dtype=int)
 # Five markers for the first cluster...
-y[0, :5] = 1
+y[:5] = 1
 # ... six markers for the second...
-y[1, 100:106] = 1
+y[100:106] = 2
 # ... and five markers for the third.
-y[2, 150:155] = 1
+y[150:155] = 3
 
 # Fit the model and predict the localisations
-localisations = TAGMMAP().fit_predict(X, y)
+t = TAGMMAP(max_iter=1000)
+labels = t.fit_predict(X, y)
 ```
 
 ## References
